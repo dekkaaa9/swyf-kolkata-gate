@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+publish/
+
+# Never commit game binaries or patched artifacts
+*.dll
+*.pdb
+*.patched
+*.orig-backup
+
+# Secrets (API keys etc.)
+secrets.json
+*.key
+.env
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# OS
+Thumbs.db
+desktop.ini
