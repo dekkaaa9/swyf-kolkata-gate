@@ -17,8 +17,9 @@ namespace SwyfAuthPatcher
     /// session is authenticated, which unlocks offline/BYOK play.
     ///
     /// Safety: every target method is verified by raw CIL SHA-256 before
-    /// and after patching. The tool refuses to run against an unrecognized
-    /// build and is idempotent (already-patched input is detected).
+    /// patching (against the input image) and after patching (against a
+    /// reloaded image of the rewritten module). The tool refuses to run
+    /// against an unrecognized build and is idempotent.
     ///
     /// For research and educational use. Supply your own copy of the game.
     /// </summary>
@@ -125,8 +126,8 @@ namespace SwyfAuthPatcher
                 }
                 if (hash != target.OriginalHash)
                 {
-                    Console.Error.WriteLine($"   status     : REFUSED - CIL does not match any known build.");
-                    Console.Error.WriteLine("               expected original or patched hash; got neither.");
+                    Console.Error.WriteLine("   status     : REFUSED - CIL matches neither the analyzed original");
+                    Console.Error.WriteLine("               nor the patched hash. Unknown build; aborting.");
                     return 1;
                 }
 
@@ -137,18 +138,9 @@ namespace SwyfAuthPatcher
                     InitLocals = false
                 };
                 body.Instructions.Add(Instruction.Create(ConstantOpCode(target.Constant)));
-                body.Instructions.Add(OpCodes.Ret);
+                body.Instructions.Add(Instruction.Create(OpCodes.Ret));
                 method.Body = body;
                 anyChange = true;
-
-                string newHash = Sha256Hex(ReadRawIl(module, method));
-                Console.WriteLine($"   new cil    : {newHash}");
-                if (newHash != target.PatchedHash)
-                {
-                    Console.Error.WriteLine("   status     : REFUSED - post-patch hash mismatch (dnlib version drift?).");
-                    return 1;
-                }
-                Console.WriteLine($"   status     : patched -> ldc.i4.{target.Constant}; ret");
             }
 
             if (!anyChange)
@@ -158,7 +150,43 @@ namespace SwyfAuthPatcher
                 return 0;
             }
 
-            module.Write(output);
+            // Rewrite to memory, reload, and verify the patched CIL hashes
+            // against the artifact that will actually be written to disk.
+            byte[] rewritten;
+            using (var ms = new MemoryStream())
+            {
+                module.Write(ms);
+                rewritten = ms.ToArray();
+            }
+
+            using (var verifyMs = new MemoryStream(rewritten, writable: false))
+            {
+                var reloaded = ModuleDefMD.Load(verifyMs);
+                var reloadedType = reloaded.GetTypes().FirstOrDefault(t => t.Name == "KolkataApi");
+                if (reloadedType == null)
+                {
+                    Console.Error.WriteLine("error: verification failed - KolkataApi missing after rewrite.");
+                    return 1;
+                }
+
+                foreach (var target in Targets)
+                {
+                    var method = reloadedType.Methods.FirstOrDefault(m => m.Name == target.Name);
+                    string hash = method?.Body == null ? "<no body>" : Sha256Hex(ReadRawIl(reloaded, method));
+                    Console.WriteLine();
+                    Console.WriteLine($"-- verify {target.Name}");
+                    Console.WriteLine($"   cil sha256 : {hash}");
+                    if (hash != target.PatchedHash)
+                    {
+                        Console.Error.WriteLine("   status     : REFUSED - post-patch hash mismatch (dnlib drift?).");
+                        Console.Error.WriteLine("               nothing was written.");
+                        return 1;
+                    }
+                    Console.WriteLine($"   status     : ok (ldc.i4.{target.Constant}; ret)");
+                }
+            }
+
+            File.WriteAllBytes(output, rewritten);
             Console.WriteLine();
             Console.WriteLine($"written: {output}");
             Console.WriteLine("keep a backup of the original DLL before replacing it.");
@@ -183,6 +211,8 @@ namespace SwyfAuthPatcher
         /// Reads the raw CIL bytes of a method body, excluding the tiny/fat
         /// header, locals signature and extra sections. Matches the byte
         /// range hashed by metadata-level CIL diffing (ECMA-335 II.25.4).
+        /// Must be called against a module whose image contains the body
+        /// (i.e. freshly loaded), not against in-memory edits.
         /// </summary>
         private static byte[] ReadRawIl(ModuleDefMD module, MethodDef method)
         {
