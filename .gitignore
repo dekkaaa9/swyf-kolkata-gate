@@ -2,6 +2,8 @@
 bin/
 obj/
 publish/
+dist/
+*.exe
 
 # Never commit game binaries or patched artifacts
 *.dll

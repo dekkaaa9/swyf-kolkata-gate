@@ -6,11 +6,16 @@ Static analysis and tooling for the client-side backend auth gate in
 The game requires an authenticated session with its official backend
 (`kolkata-auth.jataterworldwide.com`) before it will let you host a lobby or
 use the AI caller. This repository documents how that gate works at the CIL
-level, how the analysis was performed, and provides a minimal,
-hash-verified patcher that removes the dependency — plus the surrounding
-setup (Steam emulation, OpenRouter BYOK routing) needed to play offline.
+level, how the analysis was performed, and provides two patchers that remove
+the dependency — plus the surrounding setup (Steam emulation, custom AI host
+routing) needed to play offline.
 
-**No game binaries are included.** The patcher operates on a copy you supply.
+**No game binaries are included.** The patchers operate on a copy you supply.
+
+| Tool | What it is |
+|---|---|
+| [`tools/SwyfAiPatcher`](tools/SwyfAiPatcher) | GUI + CLI patcher: auth gate, custom AI endpoint, turn timeout, model pre-set. **Start here.** |
+| [`patcher/`](patcher) | Minimal CLI reference implementation for the auth gate alone, with CIL hash verification. |
 
 ---
 
@@ -22,10 +27,10 @@ Complete walkthrough. You need your own copy of the game.
 
 | Thing | Notes |
 |---|---|
-| .NET 7+ SDK | to build the patcher |
+| .NET 7+ SDK | to build the patchers |
 | *Scam With Your Friends* | Steam AppID `4954910` |
 | Goldberg Steam Emulator | x64 build, open source |
-| OpenRouter API key | free tier is sufficient |
+| API key | for any OpenAI-compatible host (OpenRouter works too) |
 
 ### Step 1 — Steam emulation (Goldberg)
 
@@ -53,7 +58,49 @@ API with the Goldberg emulator so every Steam call resolves locally:
 Verify in `Player.log`: the emulator initializes and reports
 `appId=4954910`.
 
-### Step 2 — Patch the auth gate
+### Step 2 — Patch the assembly
+
+Two options. The GUI tool does everything in one click; the CLI reference
+patcher only rewrites the auth gate.
+
+#### Option A — GUI patcher (recommended)
+
+```
+cd tools\SwyfAiPatcher
+.\build.ps1                 # framework-dependent (~1.3 MB, needs .NET 7 Desktop Runtime)
+.\build.ps1 -SelfContained  # self-contained (~68 MB, runs anywhere)
+```
+
+Run `dist\SwyfAiPatcher.exe`, point it at the game's `Assembly-CSharp.dll`
+(**Auto-detect** finds it in most Steam libraries), set your endpoint and
+model, press **PATCH**.
+
+It applies, in one pass:
+
+| Patch | Effect |
+|---|---|
+| Auth gate | `get_BackendAuthenticated` / `get_BackendAuthStatus` / `get_CanStartGame` forced to constants — offline builds reach the host menu |
+| AI endpoint | every absolute `https://…/chat/completions` literal rewritten to your host |
+| Turn timeout | the hard 15s caller-AI turn cap raised (default 60s) so provider cold starts survive |
+| Game settings | model pre-written into the registry, key field un-hidden |
+
+A backup (`Assembly-CSharp.dll.swyfbak`) is written next to the DLL on first
+run. **RESTORE BACKUP** puts the original back.
+
+Command-line equivalent (same binary, no GUI):
+
+```
+SwyfAiPatcher.exe <path-to-Assembly-CSharp.dll> ^
+    --endpoint https://your.host/v1/chat/completions ^
+    --model your-model-id ^
+    --timeout 60
+```
+
+Useful flags: `--no-auth` (skip the auth gate on a normal signed-in copy),
+`--no-registry` (DLL only), `--verify` (report current patch state),
+`--restore` (put the backup back).
+
+#### Option B — CLI reference patcher (auth gate only)
 
 1. Back up the original assembly:
 
@@ -90,23 +137,50 @@ Verify in `Player.log`: the emulator initializes and reports
    copy Assembly-CSharp.dll.patched "Scam With Your Friends_Data\Managed\Assembly-CSharp.dll"
    ```
 
-### Step 3 — AI backend (OpenRouter BYOK)
+### Step 3 — AI backend (custom host via the BYOK slot)
 
-1. In-game: **Host Settings → Backend AI → OpenRouter (Bring Your Own Key)**,
-   paste your key.
-2. The default model (`deepseek/deepseek-v4.1-flash`) is paid. On a
-   `$0`-balance key it returns `402 Insufficient credits` and the caller
-   falls back to a canned "AI service temporarily unavailable" line. Either:
-   - top up credits at <https://openrouter.ai/settings/credits>, **or**
-   - switch to a free model by editing the active build's settings file:
+The game's caller AI is driven through one direct-API slot. In the UI and the
+logs it is labelled **OpenRouter**, but that is only the slot's internal name —
+the destination is a literal in the assembly, and the patcher rewrites it to
+any OpenAI-compatible `/chat/completions` endpoint.
 
-     ```
-     %USERPROFILE%\AppData\LocalLow\Jatater Worldwide\Scam With Your Friends\
-         prompts\builds\<build-hash>\model-settings.json
-     ```
+1. Patch the endpoint with the GUI tool (or `--endpoint` on the CLI), e.g.
+   `https://your-host.example/v1/chat/completions`.
+2. In-game: **Host Settings → Backend AI → OpenRouter (Bring Your Own Key)**,
+   paste your host's API key. The field still says "OpenRouter" — that is
+   cosmetic; the request goes to the endpoint you set.
+3. The model is pre-written by the patcher. To change it later, edit the
+   model field in the same panel, or re-run the patcher with `--model`.
+4. Start a call. The first reply can take 20–30 seconds while the provider's
+   instance warms up (this is why the patcher raises the 15s turn timeout);
+   after that expect 3–5 seconds per turn.
 
-     Set every `openrouter.model` value to a `:free` model, e.g.
-     `nvidia/nemotron-3.5-lightning:free`, then restart the game.
+Two endpoint literals exist in the shipped build and both are rewritten:
+
+```
+https://openrouter.ai/api/v1/chat/completions
+https://inference.celeris.ai/celeris-1/v1/chat/completions
+```
+
+The request body the game builds carries OpenRouter-specific fields
+(`provider.require_parameters`, `response_format` as `json_schema`). Most
+OpenAI-compatible proxies ignore unknown fields; if yours rejects them, strip
+them in `KolkataApi.PrepareDirectOpenRouterBody`.
+
+If you would rather stay on OpenRouter itself: the default model
+(`deepseek/deepseek-v4.1-flash`) is paid, so a `$0`-balance key returns
+`402 Insufficient credits` and the caller falls back to a canned line. Switch
+to a `:free` model by editing the active build's settings file:
+
+```
+%USERPROFILE%\AppData\LocalLow\Jatater Worldwide\Scam With Your Friends\
+    prompts\builds\<build-hash>\model-settings.json
+```
+
+Set every `openrouter.model` value to a `:free` model, e.g.
+`nvidia/nemotron-3.5-lightning:free`, then restart the game. Note the free
+tier allows 50 requests per day **per account**, shared across all `:free`
+models.
 
 ### Step 4 — Verify
 
@@ -114,12 +188,15 @@ Launch, host a game, start a call. In `Player.log` you should see:
 
 - `[MetaFizzySteamworks] Starting server [SteamSockets]` → `Server started listening`
 - `[MetaterSteam] Lobby creation callback: … result=k_EResultOK`
-- `[KolkataOpenRouter] route=OpenRouter-byok … http=200` during the call
+- `[KolkataOpenRouter] route=OpenRouter-byok … direction=response … http=200` during the call
 - Caller dialogue is generated, not the fallback line
 
 `[KolkataApi] Sign-in failure: … http=401 code=STEAM_REJECTED` is
 **expected and harmless** — the patched getters no longer consult the
 backend result.
+
+To confirm the destination independently of the game, run the patcher with
+`--verify`; it lists every endpoint literal currently in the assembly.
 
 ### Troubleshooting
 
@@ -127,15 +204,22 @@ backend result.
 |---|---|---|
 | `UNSUPPORTED_APP` on launch | missing `steam_appid.txt` | create it with `4954910` |
 | No lobby, networking dead | Goldberg `steam_api64.dll` not in game root | re-copy, keep `steam_settings/` |
-| Caller says "AI temporarily unavailable" | `402` from OpenRouter | add credits or use a `:free` model |
+| Caller says "AI temporarily unavailable" | `402` from the host | add credits or use a free model |
+| First call always fails, later calls fine | provider cold start exceeds the turn timeout | raise `--timeout` to 90 and re-patch |
+| Request hangs, no `direction=response` line | host unreachable or TLS-fingerprint filtering | test the endpoint with `curl` first |
 | Patcher: "CIL matches neither" | different game build | re-analyze; update the hash table in `Patcher.cs` |
 | Patcher: "already patched" | input is the patched DLL | restore from `.orig-backup` first |
 
 ### Reverting
 
-```
-copy Assembly-CSharp.dll.orig-backup "Scam With Your Friends_Data\Managed\Assembly-CSharp.dll"
-```
+Close the game first, then either:
+
+- GUI tool → **RESTORE BACKUP** (puts `Assembly-CSharp.dll.swyfbak` back), or
+- manually:
+
+  ```
+  copy Assembly-CSharp.dll.orig-backup "Scam With Your Friends_Data\Managed\Assembly-CSharp.dll"
+  ```
 
 Restore the original `steam_api64.dll` and delete `steam_appid.txt` /
 `steam_settings/`.
@@ -203,8 +287,20 @@ SHA-256 — those hashes become the patcher's verification gate.
 
 ### 6. Reproduce as a tool
 
-The patcher performs the same rewrite with dnlib and re-verifies the
-hashes against the rewritten artifact. See [`patcher/`](patcher/).
+The reference patcher performs the same rewrite with dnlib and re-verifies the
+hashes against the rewritten artifact. See [`patcher/`](patcher).
+
+The GUI patcher in [`tools/SwyfAiPatcher`](tools/SwyfAiPatcher) builds on the
+same analysis and adds two further rewrites found the same way:
+
+- **AI endpoint literals** — located by scanning every `ldstr` in the
+  assembly for absolute `https://…chat/completions` URLs; two exist
+  (OpenRouter and an inference host) and both are rewritten.
+- **Caller turn timeout** — `CallerAiPipeline/<SendExperimentalTurnAsync>`
+  contains `ldc.r8 15 → TimeSpan.FromSeconds → CTS.CancelAfter`, a hard 15s
+  cap on each AI turn. Serverless providers routinely exceed it on a cold
+  start, which surfaces as `The operation was canceled` and the canned
+  fallback line.
 
 The full annotated IL listings, hash tables, and defender notes are in
 [`docs/writeup.md`](docs/writeup.md).
@@ -214,6 +310,13 @@ The full annotated IL listings, hash tables, and defender notes are in
 ## Repository layout
 
 ```
+tools/
+  SwyfAiPatcher/
+    SwyfAiPatcher.csproj     WinForms GUI + CLI, net7.0-windows
+    PatcherCore.cs           all patch logic (auth gate, endpoint, timeout, registry)
+    MainForm.cs              GUI
+    Program.cs               entry point; CLI when arguments are passed
+    build.ps1                publish script (framework-dependent or self-contained)
 patcher/
   Patcher.cs              dnlib tool rewriting the three gate getters
   SwyfAuthPatcher.csproj
@@ -222,8 +325,11 @@ docs/
   writeup.md              full analysis: architecture, annotated IL,
                           hashes, defender notes
   setup.md                deep-dive environment setup
-.gitignore                blocks *.dll, *.pdb, *.patched, secrets
+.gitignore                blocks *.dll, *.pdb, *.exe, dist/, secrets
 ```
+
+Pre-built binaries are distributed as GitHub Release assets, not committed —
+`build.ps1` reproduces them from source.
 
 ## Verification
 
